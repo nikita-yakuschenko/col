@@ -31,11 +31,13 @@ def read_line() -> dict[str, Any]:
     return read_json(line_path(), default={}) or {}
 
 
-def write_line(line: int, active: bool) -> None:
-    write_json(
-        line_path(),
-        {"line": line, "active": active, "updated_at": _now()},
-    )
+def write_line(line: int, active: bool, activation: dict[str, Any] | None = None) -> None:
+    payload: dict[str, Any] = {"line": line, "active": active, "updated_at": _now()}
+    if activation is not None:
+        payload["activation"] = activation
+    elif (previous := read_line().get("activation")) is not None:
+        payload["activation"] = previous
+    write_json(line_path(), payload)
 
 
 def read_bridge() -> dict[str, Any]:

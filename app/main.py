@@ -91,7 +91,7 @@ async def b24_handler(request: Request):
 
     if payload.get("PLACEMENT"):
         _save_auth(payload, source="placement")
-        return HTMLResponse(_settings_page(payload))
+        return HTMLResponse(await _settings_page(payload))
 
     event = (payload.get("event") or "").upper()
     if not event:
@@ -310,12 +310,48 @@ _INSTALL_PAGE = """<!doctype html>
 """
 
 
-def _settings_page(payload: dict[str, str]) -> str:
+async def _ensure_activated(line: int) -> dict[str, object]:
+    """Активирует коннектор на линии через REST.
+
+    Родная кнопка в карточке коннектора переключает только вид: вызвать
+    imconnector.activate обязано само приложение, иначе отправка сообщений
+    падает с NOT_ACTIVE_LINE, хотя в интерфейсе всё выглядит подключённым.
+    """
+    client = BitrixClient()
+    try:
+        await client.call(
+            "imconnector.activate",
+            {"CONNECTOR": settings.connector_id, "LINE": line, "ACTIVE": "1"},
+        )
+        log.info("Коннектор активирован на линии %s", line)
+        return {"ok": True, "at": datetime.now(timezone.utc).isoformat()}
+    except BitrixError as error:
+        log.error("Активация линии %s не прошла: %s", line, error)
+        report: dict[str, object] = {
+            "ok": False,
+            "error": error.code,
+            "description": error.description,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        # Если линии с таким id нет, полезно сразу увидеть, какие вообще есть.
+        try:
+            configs = await client.call("imopenlines.config.list.get", {}) or []
+            report["known_lines"] = [
+                {"id": item.get("ID"), "name": item.get("LINE_NAME"), "active": item.get("ACTIVE")}
+                for item in configs
+                if isinstance(item, dict)
+            ]
+        except Exception:  # noqa: BLE001 — это диагностика, падать из-за неё нельзя
+            log.exception("Не удалось получить список открытых линий")
+        return report
+
+
+async def _settings_page(payload: dict[str, str]) -> str:
     """Страница коннектора в слайдере Битрикса.
 
     Своей кнопки подключения здесь нет намеренно: рядом уже есть родная
-    битриксовая, и две кнопки для одного действия только путают. Мы лишь
-    запоминаем линию и её состояние, которые Битрикс передаёт в PLACEMENT_OPTIONS.
+    битриксовая, и две кнопки для одного действия только путают. Активацию
+    делаем сами, молча, при открытии настроек.
     """
     options: dict[str, object] = {}
     try:
@@ -332,14 +368,20 @@ def _settings_page(payload: dict[str, str]) -> str:
             " конкретной открытой линии."
         )
 
-    state.write_line(int(line), active)
-    log.info("Линия %s, подключение: %s", line, active)
+    activation = await _ensure_activated(int(line)) if active else None
+    state.write_line(int(line), active, activation)
+    log.info("Линия %s, подключение: %s, активация: %s", line, active, activation)
 
-    status = (
-        f'<span class="status active">Подключён к линии {html.escape(line)}</span>'
-        if active
-        else '<span class="status">Не подключён. Нажмите «Подключить» выше.</span>'
-    )
+    if not active:
+        status = '<span class="status">Не подключён. Нажмите «Подключить» выше.</span>'
+    elif activation and activation.get("ok"):
+        status = f'<span class="status active">Подключён к линии {html.escape(line)}</span>'
+    else:
+        detail = html.escape(str((activation or {}).get("error", "неизвестная ошибка")))
+        status = (
+            f'<span class="status">Линия {html.escape(line)}: Битрикс отклонил активацию'
+            f" ({detail}). Подробности в /health.</span>"
+        )
     snapshot = runtime.snapshot()
     session = (
         '<span class="status active">Сессия ДомКлик активна</span>'
