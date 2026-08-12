@@ -93,6 +93,18 @@ context.on('response', async (response) => {
     postData: request.postData() ?? null,
   };
 
+  // Бинарные тела (multipart с файлом) в postData не попадают, а именно они и
+  // нужны, чтобы увидеть имена полей формы. Кладём в base64, с ограничением.
+  if (!record.postData && request.method() !== 'GET') {
+    const buffer = request.postDataBuffer();
+    if (buffer && buffer.length <= 1024 * 1024) {
+      record.postDataBase64 = buffer.toString('base64');
+      record.postDataBytes = buffer.length;
+    } else if (buffer) {
+      record.postDataBytes = buffer.length;
+    }
+  }
+
   // Тело может быть уже недоступно (редирект, отменённый запрос) — это нормально.
   if (BODY_TYPES.has(resourceType)) {
     try {
