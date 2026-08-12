@@ -24,6 +24,15 @@ PROJECT_RE = re.compile(r"по проекту дома\s+[«\"]([^»\"]+)[»\"]"
 # Битрикс присылает ответ оператора с BB-кодами и подписью автора.
 BB_TAGS = re.compile(r"\[/?[a-zA-Z]+(?:=[^\]]*)?\]")
 
+# Подпись оператора в начале сообщения: «[b]Имя Фамилия:[/b] [br]текст».
+SIGNATURE = re.compile(r"^\s*\[b\](?P<name>[^\[]+?):?\[/b\]\s*(?:\[br\])?\s*", re.IGNORECASE)
+
+# Чем выделять имя оператора. Пустые обёртки — простой текст: у кириллицы нет
+# юникодного жирного начертания, так что выделение возможно только если чат
+# ДомКлик понимает разметку. Проверяется отправкой пробного сообщения.
+NAME_WRAP_BEFORE = ""
+NAME_WRAP_AFTER = ""
+
 
 class Bridge:
     def __init__(self, dc: domclick.DomClickClient, b24: BitrixClient, own_cas_id: int) -> None:
@@ -231,12 +240,23 @@ def _as_int(value: Any) -> int:
 
 
 def strip_operator_markup(text: str) -> str:
-    """Чистит текст ответа оператора перед отправкой в ДомКлик.
+    """Готовит ответ оператора к отправке в ДомКлик.
 
-    Битрикс подставляет подпись и BB-коды: «[b]Имя:[/b] [br]текст». В чате
-    ДомКлик разметка не поддерживается и приехала бы как мусор.
+    Битрикс подставляет подпись и BB-коды: «[b]Имя:[/b] [br]текст». Разметку
+    убираем, а подпись отделяем от текста пустой строкой — так в чате клиента
+    видно, где кончается имя и начинается ответ.
     """
+    signature = SIGNATURE.match(text)
+    name = ""
+    if signature:
+        name = signature.group("name").strip()
+        text = text[signature.end():]
+
     text = text.replace("[br]", "\n")
     text = BB_TAGS.sub("", text)
     # После вырезания тегов остаются висячие пробелы по краям строк.
-    return "\n".join(line.strip() for line in text.splitlines()).strip()
+    body = "\n".join(line.strip() for line in text.splitlines()).strip()
+
+    if not name:
+        return body
+    return f"{NAME_WRAP_BEFORE}{name}{NAME_WRAP_AFTER}\n\n{body}".strip()
