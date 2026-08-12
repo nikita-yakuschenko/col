@@ -26,6 +26,9 @@ const SESSION_DIR = path.join(ROOT, 'recon-out', new Date().toISOString().replac
 /** Ресурсы, которые только шумят в дампе. */
 const SKIP_TYPES = new Set(['image', 'font', 'stylesheet', 'media']);
 
+/** Картинки обычно шум, но при разборе вложений именно они и нужны: `--images`. */
+const KEEP_IMAGES = process.argv.includes('--images');
+
 /** Аналитика и трекеры — не наша цель. */
 const SKIP_HOSTS = /(?:mc\.yandex|google-analytics|googletagmanager|doubleclick|criteo|top-fwz1|top-mail|vk\.com\/rtrg|sentry\.io|smartlook|hotjar|facebook\.net)/i;
 
@@ -59,8 +62,11 @@ const write = (stream, record) => {
   stream.write(JSON.stringify({ ts: Date.now(), ...record }) + '\n');
 };
 
-const interesting = (url, resourceType) =>
-  !SKIP_TYPES.has(resourceType) && !SKIP_HOSTS.test(url);
+const interesting = (url, resourceType) => {
+  if (SKIP_HOSTS.test(url)) return false;
+  if (KEEP_IMAGES && resourceType === 'image') return true;
+  return !SKIP_TYPES.has(resourceType);
+};
 
 const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
   headless: false,

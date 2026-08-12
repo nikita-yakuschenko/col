@@ -8,6 +8,7 @@
     "postinstall": "playwright install chromium",
     "capture": "node capture.mjs",
     "analyze": "node analyze.mjs",
+    "capture-files": "node capture.mjs --images",
     "export-cookies": "node export-cookies.mjs"
   },
   "devDependencies": {

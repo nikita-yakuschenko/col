@@ -14,7 +14,16 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const USER_DATA_DIR = path.join(HERE, '.userdata');
 const OUT = path.resolve(HERE, '..', 'storage-state.json');
 
+const CABINET = process.env.DOMCLICK_START_URL ?? 'https://homeland-projects.domclick.ru/';
+
 const context = await chromium.launchPersistentContext(USER_DATA_DIR, { headless: true });
+
+// Обязательно открыть страницу: без визита Playwright не собирает localStorage,
+// а там лежит x-access-token, без которого не работает загрузка файлов.
+const page = await context.newPage();
+await page.goto(CABINET, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
+await page.waitForTimeout(3000);
+
 const state = await context.storageState({ path: OUT });
 await context.close();
 
@@ -26,4 +35,10 @@ for (const cookie of state.cookies) {
 console.log(`Кук выгружено: ${state.cookies.length} -> ${OUT}`);
 for (const [domain, count] of [...domains].sort((a, b) => b[1] - a[1]).slice(0, 10)) {
   console.log(`  x${count}\t${domain}`);
+}
+
+const origins = state.origins ?? [];
+console.log(`Origins с localStorage: ${origins.length}`);
+for (const origin of origins) {
+  console.log(`  ${origin.origin}: ${(origin.localStorage ?? []).length} ключей`);
 }
