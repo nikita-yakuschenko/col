@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -27,11 +28,10 @@ BB_TAGS = re.compile(r"\[/?[a-zA-Z]+(?:=[^\]]*)?\]")
 # Подпись оператора в начале сообщения: «[b]Имя Фамилия:[/b] [br]текст».
 SIGNATURE = re.compile(r"^\s*\[b\](?P<name>[^\[]+?):?\[/b\]\s*(?:\[br\])?\s*", re.IGNORECASE)
 
-# Чем выделять имя оператора. Пустые обёртки — простой текст: у кириллицы нет
-# юникодного жирного начертания, так что выделение возможно только если чат
-# ДомКлик понимает разметку. Проверяется отправкой пробного сообщения.
-NAME_WRAP_BEFORE = ""
-NAME_WRAP_AFTER = ""
+# Чем выделять имя оператора. Проверено вживую 13.08.2026: чат ДомКлик понимает
+# markdown — `**` даёт жирный, `*` курсив, работает и HTML `<b>`.
+NAME_WRAP_BEFORE = "**"
+NAME_WRAP_AFTER = "**"
 
 
 class Bridge:
@@ -53,6 +53,14 @@ class Bridge:
         await self.handle_message(message, room)
 
     async def handle_message(self, message: dict[str, Any], room: dict[str, Any]) -> None:
+        # Сообщение без текста от клиента — почти наверняка вложение. Формат
+        # таких сообщений мы ещё не видели, поэтому пишем его целиком.
+        if message.get("type") == "message" and not str(message.get("message") or "").strip():
+            log.warning(
+                "Сообщение без текста, вероятно вложение: %s",
+                json.dumps(message, ensure_ascii=False)[:2000],
+            )
+
         reason = self._skip_reason(message, room)
         if reason:
             self.skipped += 1
@@ -172,7 +180,15 @@ async def deliver_operator_reply(
             room_id = state.room_for(int(cas_id)) if cas_id else ""
 
         if not text or not room_id:
-            log.warning("Ответ оператора не отправлен: текст=%r комната=%r", text[:40], room_id)
+            # Скорее всего оператор приложил файл: события с вложениями Битрикс
+            # шлёт без текста. Пишем payload целиком — по нему разберём формат
+            # и научимся передавать вложения.
+            log.warning(
+                "Ответ оператора не отправлен: текст=%r комната=%r payload=%s",
+                text[:40],
+                room_id,
+                json.dumps(item, ensure_ascii=False)[:2000],
+            )
             continue
 
         try:
