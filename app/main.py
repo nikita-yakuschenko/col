@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app.bitrix import BitrixClient, BitrixError, register_connector
 from app.config import settings
 from app.storage import read_json, write_json
 
@@ -50,8 +51,34 @@ async def health() -> JSONResponse:
             "b24_installed": bool(tokens.get("access_token")),
             "install_source": tokens.get("source", ""),
             "connector_id": settings.connector_id,
+            "connector_registered": read_json(_register_report_path(), default={}),
         }
     )
+
+
+def _register_report_path():
+    return settings.data_dir / "connector_registration.json"
+
+
+async def _register_connector_safely() -> None:
+    """Регистрирует коннектор после установки.
+
+    Ошибку сюда не выпускаем: если регистрация не удалась, установка всё равно
+    должна завершиться, иначе приложение застрянет в подвешенном состоянии.
+    Результат кладём в /health, чтобы было видно без доступа к логам.
+    """
+    report: dict[str, object] = {"at": datetime.now(timezone.utc).isoformat()}
+    try:
+        report["result"] = await register_connector(BitrixClient())
+        report["ok"] = True
+        log.info("Коннектор зарегистрирован: %s", report["result"])
+    except BitrixError as error:
+        report.update({"ok": False, "error": error.code, "description": error.description})
+        log.error("Регистрация коннектора не удалась: %s", error)
+    except Exception as error:  # noqa: BLE001 — установка важнее любой неожиданности
+        report.update({"ok": False, "error": type(error).__name__, "description": str(error)})
+        log.exception("Регистрация коннектора упала")
+    write_json(_register_report_path(), report)
 
 
 @app.api_route("/b24/install", methods=["GET", "POST"])
@@ -65,6 +92,8 @@ async def b24_install(request: Request) -> HTMLResponse:
     payload = await _payload(request)
     saved = _save_auth(payload, source="install")
     log.info("Установка через страницу: токены %s", "сохранены" if saved else "не пришли")
+    if saved:
+        await _register_connector_safely()
     return HTMLResponse(_INSTALL_PAGE)
 
 
@@ -91,6 +120,8 @@ async def b24_handler(request: Request):
     if event == "ONAPPINSTALL":
         saved = _save_auth(payload, source="event")
         log.info("Установка событием ONAPPINSTALL: токены %s", "сохранены" if saved else "отклонены")
+        if saved:
+            await _register_connector_safely()
         return JSONResponse({"ok": saved})
 
     if event == "ONAPPUNINSTALL":
