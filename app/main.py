@@ -34,11 +34,15 @@ log = logging.getLogger("bridge")
 # Одноразовые ключи для формы загрузки кук: nonce -> момент истечения.
 _nonces: dict[str, float] = {}
 
+# Счётчики событий: без них отклонённое событие видно только в логах контейнера.
+_events: dict[str, object] = {"received": 0, "rejected": 0, "last": "", "last_reject_reason": ""}
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     log.info("Старт. Данные: %s", settings.data_dir)
+    _migrate_tokens()
     if settings.missing:
         log.warning("Не заданы переменные окружения: %s", ", ".join(settings.missing))
     await runtime.start()
@@ -66,6 +70,7 @@ async def health() -> JSONResponse:
             "connector_id": settings.connector_id,
             "connector_registered": read_json(_register_report_path(), default={}),
             "line": state.read_line(),
+            "events": dict(_events),
             "domclick": runtime.snapshot(),
         }
     )
@@ -105,15 +110,20 @@ async def b24_handler(request: Request):
             await _register_connector_safely()
         return JSONResponse({"ok": saved})
 
-    if event == "ONAPPUNINSTALL":
-        if _verify_event(payload):
-            write_json(settings.tokens_path, {})
-            log.warning("Приложение удалено, токены очищены")
-        return JSONResponse({"ok": True})
+    _events["received"] = int(_events["received"]) + 1
+    _events["last"] = event
 
-    if not _verify_event(payload):
-        log.warning("Событие %s отклонено: неверный application_token", event)
-        return JSONResponse({"ok": False, "error": "invalid token"}, status_code=403)
+    verified, reason = _verify_event(payload)
+    if not verified:
+        _events["rejected"] = int(_events["rejected"]) + 1
+        _events["last_reject_reason"] = reason
+        log.warning("Событие %s отклонено: %s", event, reason)
+        return JSONResponse({"ok": False, "error": reason}, status_code=403)
+
+    if event == "ONAPPUNINSTALL":
+        write_json(settings.tokens_path, {})
+        log.warning("Приложение удалено, токены очищены")
+        return JSONResponse({"ok": True})
 
     data = parse_bracketed(payload).get("data") or {}
 
@@ -205,6 +215,22 @@ async def _register_connector_safely() -> None:
 
 # --- вспомогательное --------------------------------------------------------
 
+def _migrate_tokens() -> None:
+    """Разовый перенос старого формата токенов.
+
+    Раньше в application_token попадал APP_SID со страницы установки — другое
+    значение, из-за которого проверка отбивала все события. Сбрасываем его,
+    чтобы настоящий токен подхватился из первого же события.
+    """
+    tokens = read_json(settings.tokens_path, default={}) or {}
+    if not tokens or "app_sid" in tokens:
+        return
+    tokens["app_sid"] = tokens.get("application_token", "")
+    tokens["application_token"] = ""
+    write_json(settings.tokens_path, tokens)
+    log.warning("Токены переведены в новый формат, application_token сброшен")
+
+
 def _issue_nonce() -> str:
     now = time.time()
     for key, expires in list(_nonces.items()):
@@ -238,6 +264,11 @@ def _save_auth(payload: dict[str, str], *, source: str) -> bool:
         log.warning("Запрос с чужого портала отклонён: %s", domain)
         return False
 
+    previous = read_json(settings.tokens_path, default={}) or {}
+    # APP_SID со страницы установки — это НЕ application_token из событий.
+    # Путать их нельзя: иначе проверка событий будет отбивать всё подряд.
+    application_token = payload.get("auth[application_token]") or previous.get("application_token", "")
+
     write_json(
         settings.tokens_path,
         {
@@ -246,9 +277,8 @@ def _save_auth(payload: dict[str, str], *, source: str) -> bool:
             "expires_in": payload.get("AUTH_EXPIRES") or payload.get("auth[expires_in]", ""),
             "member_id": payload.get("member_id") or payload.get("auth[member_id]", ""),
             "domain": domain,
-            "application_token": (
-                payload.get("APP_SID") or payload.get("auth[application_token]", "")
-            ),
+            "app_sid": payload.get("APP_SID", ""),
+            "application_token": application_token,
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "source": source,
         },
@@ -257,11 +287,39 @@ def _save_auth(payload: dict[str, str], *, source: str) -> bool:
     return True
 
 
-def _verify_event(payload: dict[str, str]) -> bool:
-    """Путь обработчика публичный, поэтому события без верного токена отбиваем."""
-    stored = read_json(settings.tokens_path, default={}).get("application_token")
+def _verify_event(payload: dict[str, str]) -> tuple[bool, str]:
+    """Проверяет, что событие действительно от нашего портала.
+
+    Путь обработчика публичный, поэтому пускать всё подряд нельзя. Но и жёстко
+    требовать совпадения с APP_SID нельзя: при установке через браузерную
+    страницу Битрикс отдаёт APP_SID, а в событиях присылает application_token,
+    и это разные значения. Поэтому опираемся на портал и member_id, а токен
+    запоминаем с первого события и дальше уже сверяем.
+    """
+    tokens = read_json(settings.tokens_path, default={})
+    domain = payload.get("auth[domain]") or payload.get("DOMAIN", "")
+    member = payload.get("auth[member_id]") or payload.get("member_id", "")
     incoming = payload.get("auth[application_token]") or payload.get("application_token", "")
-    return bool(stored) and stored == incoming
+
+    if domain and not _is_our_portal(domain):
+        return False, f"чужой портал: {domain}"
+    if member and tokens.get("member_id") and member != tokens["member_id"]:
+        return False, "не совпал member_id"
+    if not domain and not member:
+        return False, "нет ни портала, ни member_id"
+
+    stored = tokens.get("application_token") or ""
+    if stored and incoming:
+        if not secrets.compare_digest(stored.encode(), incoming.encode()):
+            return False, "не совпал application_token"
+        return True, ""
+
+    if incoming and not stored:
+        # Первое событие: запоминаем токен, дальше сверяем уже по нему.
+        tokens["application_token"] = incoming
+        write_json(settings.tokens_path, tokens)
+        log.info("application_token получен из события и сохранён")
+    return True, ""
 
 
 def _is_our_portal(domain: str) -> bool:
