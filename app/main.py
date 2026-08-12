@@ -59,6 +59,10 @@ async def health() -> JSONResponse:
             "time": datetime.now(timezone.utc).isoformat(),
             "b24_configured": settings.is_b24_configured,
             "b24_installed": bool(tokens.get("access_token")),
+            # Диагностика окружения: без неё пустая переменная выясняется только
+            # по отказу формы, и непонятно, чей это косяк — кода или деплоя.
+            "env_missing": settings.missing,
+            "admin_upload": bool(settings.admin_token),
             "connector_id": settings.connector_id,
             "connector_registered": read_json(_register_report_path(), default={}),
             "line": state.read_line(),
