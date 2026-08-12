@@ -26,6 +26,15 @@ SYSTEM_CAS_ID = -900
 # Тег, по которому проектные комнаты отличаются от ипотечных и по объявлениям.
 PROJECT_TAG = "suburban_developer"
 
+# Тег сделки. В таких комнатах сидят покупатели, представители застройщика
+# и ИИ-помощник — это не обращения к подрядчику, нам они не нужны.
+DEAL_TAG = "deal"
+
+# В обращении к подрядчику участвуют только клиент и наши учётки. Всё
+# остальное (BOT — ИИ-помощник, BUYER — покупатель, AGENT — представитель
+# застройщика) означает, что комната из другого сценария.
+ALLOWED_ROLES = {"USER", "CONTRACTOR"}
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -158,7 +167,26 @@ def room_tags(room: dict[str, Any]) -> dict[str, str]:
 
 
 def is_project_room(room: dict[str, Any]) -> bool:
-    return PROJECT_TAG in room_tags(room)
+    """Комната-обращение к подрядчику, а не чат по сделке.
+
+    Проверяем двумя независимыми способами: по тегам и по составу участников.
+    Тега `suburban_developer` на боевых данных достаточно, но состав участников
+    подстрахует, если ДомКлик начнёт расставлять теги иначе.
+    """
+    tags = room_tags(room)
+    if PROJECT_TAG not in tags or DEAL_TAG in tags:
+        return False
+    return not foreign_roles(room)
+
+
+def foreign_roles(room: dict[str, Any]) -> set[str]:
+    """Роли участников, которых в обращении к подрядчику быть не должно."""
+    found: set[str] = set()
+    for member in room.get("members") or []:
+        for role in member.get("chatRole") or []:
+            if role not in ALLOWED_ROLES:
+                found.add(role)
+    return found
 
 
 def client_cas_id(room: dict[str, Any]) -> int | None:
