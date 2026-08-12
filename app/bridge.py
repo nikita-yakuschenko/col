@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any
 
 from app import domclick, state
@@ -135,6 +136,98 @@ class Bridge:
                 "name": chat_name,
             },
         }
+
+
+async def deliver_operator_reply(
+    dc: domclick.DomClickClient,
+    b24: BitrixClient,
+    data: dict[str, Any],
+) -> int:
+    """Обратный канал: ответ оператора из Битрикса -> в чат ДомКлик.
+
+    Данные приходят из события ONIMCONNECTORMESSAGEADD.
+    """
+    line = data.get("LINE") or (state.read_line().get("line") or 0)
+    messages = _as_list(data.get("MESSAGES"))
+    delivered: list[dict[str, Any]] = []
+
+    for item in messages:
+        im = item.get("im") or {}
+        text = strip_operator_markup(str((item.get("message") or {}).get("text") or ""))
+        room_id = str((item.get("chat") or {}).get("id") or "")
+
+        if not room_id:
+            # Битрикс группирует диалоги по user.id, поэтому chat.id иногда пуст —
+            # выручает привязка, накопленная на входящих сообщениях.
+            cas_id = (item.get("message") or {}).get("user_id")
+            room_id = state.room_for(int(cas_id)) if cas_id else ""
+
+        if not text or not room_id:
+            log.warning("Ответ оператора не отправлен: текст=%r комната=%r", text[:40], room_id)
+            continue
+
+        try:
+            sent = await dc.send_message(room_id, text)
+        except Exception:  # noqa: BLE001 — один неудачный ответ не рвёт обработку остальных
+            log.exception("Не удалось отправить ответ оператора в комнату %s", room_id)
+            continue
+
+        log.info("Ответ оператора отправлен в комнату %s", room_id)
+        delivered.append(
+            {
+                "im": {"chat_id": _as_int(im.get("chat_id")), "message_id": _as_int(im.get("message_id"))},
+                "message": {"id": [sent["uuid"]], "date": int(time.time())},
+                "chat": {"id": room_id},
+            }
+        )
+
+    if delivered and line:
+        try:
+            await b24.call(
+                "imconnector.send.status.delivery",
+                {"CONNECTOR": settings.connector_id, "LINE": int(line), "MESSAGES": delivered},
+            )
+        except Exception:  # noqa: BLE001 — галочка о доставке не важнее самой доставки
+            log.exception("Подтверждение доставки не прошло")
+
+    return len(delivered)
+
+
+def parse_bracketed(form: dict[str, str]) -> dict[str, Any]:
+    """Разбирает плоские ключи вида data[MESSAGES][0][im][chat_id] в дерево.
+
+    Битрикс шлёт события формой, а не JSON, поэтому вложенность закодирована
+    в именах полей.
+    """
+    root: dict[str, Any] = {}
+    for key, value in form.items():
+        parts = re.findall(r"[^\[\]]+", key)
+        node = root
+        for part in parts[:-1]:
+            nxt = node.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[part] = nxt
+            node = nxt
+        node[parts[-1]] = value
+    return root
+
+
+def _as_list(value: Any) -> list[dict[str, Any]]:
+    """Массивы в форме приезжают словарём с числовыми ключами."""
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        keys = sorted(value.keys(), key=lambda k: int(k) if str(k).isdigit() else 0)
+        return [value[k] for k in keys if isinstance(value[k], dict)]
+    return []
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def strip_operator_markup(text: str) -> str:

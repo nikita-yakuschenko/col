@@ -49,6 +49,11 @@ class DomClickClient:
         self._cookies = cookies
         self._timeout = timeout
 
+    @property
+    def cookies(self) -> dict[str, str]:
+        """Те же куки нужны слушателю Centrifugo для рукопожатия."""
+        return dict(self._cookies)
+
     @classmethod
     def from_storage_state(cls, path: Path) -> "DomClickClient":
         """Читает куки из storage-state.json, снятого Playwright."""

@@ -1,8 +1,7 @@
 """Мост «ДомКлик → Открытые линии Битрикс24».
 
-Публичные эндпоинты, которые нужны Битриксу: установка локального приложения,
-приём событий и страница настроек коннектора. Логика чата подключается следующим
-шагом — см. docs/domclick-chat-protocol.md.
+Веб-часть: эндпоинты для Битрикса (установка, события, настройки коннектора)
+и служебная страница загрузки кук ДомКлик. Живая часть — в app/runtime.py.
 """
 
 from __future__ import annotations
@@ -19,8 +18,11 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app import state
 from app.bitrix import BitrixClient, BitrixError, register_connector
+from app.bridge import deliver_operator_reply, parse_bracketed
 from app.config import settings
+from app.runtime import runtime
 from app.storage import read_json, write_json
 
 logging.basicConfig(
@@ -29,7 +31,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("bridge")
 
-# Одноразовые ключи для формы настроек: nonce -> момент истечения.
+# Одноразовые ключи для формы загрузки кук: nonce -> момент истечения.
 _nonces: dict[str, float] = {}
 
 
@@ -39,7 +41,9 @@ async def lifespan(_: FastAPI):
     log.info("Старт. Данные: %s", settings.data_dir)
     if settings.missing:
         log.warning("Не заданы переменные окружения: %s", ", ".join(settings.missing))
+    await runtime.start()
     yield
+    await runtime.stop()
     log.info("Остановка")
 
 
@@ -48,7 +52,6 @@ app = FastAPI(title="ДомКлик → Открытые линии", lifespan=l
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    """Проверка живости: используется Dokploy и снаружи для контроля деплоя."""
     tokens = read_json(settings.tokens_path, default={})
     return JSONResponse(
         {
@@ -56,47 +59,19 @@ async def health() -> JSONResponse:
             "time": datetime.now(timezone.utc).isoformat(),
             "b24_configured": settings.is_b24_configured,
             "b24_installed": bool(tokens.get("access_token")),
-            "install_source": tokens.get("source", ""),
             "connector_id": settings.connector_id,
             "connector_registered": read_json(_register_report_path(), default={}),
-            "line": read_json(_line_state_path(), default={}),
+            "line": state.read_line(),
+            "domclick": runtime.snapshot(),
         }
     )
 
 
-def _register_report_path():
-    return settings.data_dir / "connector_registration.json"
-
-
-async def _register_connector_safely() -> None:
-    """Регистрирует коннектор после установки.
-
-    Ошибку сюда не выпускаем: если регистрация не удалась, установка всё равно
-    должна завершиться, иначе приложение застрянет в подвешенном состоянии.
-    Результат кладём в /health, чтобы было видно без доступа к логам.
-    """
-    report: dict[str, object] = {"at": datetime.now(timezone.utc).isoformat()}
-    try:
-        report["result"] = await register_connector(BitrixClient())
-        report["ok"] = True
-        log.info("Коннектор зарегистрирован: %s", report["result"])
-    except BitrixError as error:
-        report.update({"ok": False, "error": error.code, "description": error.description})
-        log.error("Регистрация коннектора не удалась: %s", error)
-    except Exception as error:  # noqa: BLE001 — установка важнее любой неожиданности
-        report.update({"ok": False, "error": type(error).__name__, "description": str(error)})
-        log.exception("Регистрация коннектора упала")
-    write_json(_register_report_path(), report)
-
+# --- Битрикс: установка -----------------------------------------------------
 
 @app.api_route("/b24/install", methods=["GET", "POST"])
 async def b24_install(request: Request) -> HTMLResponse:
-    """Установка приложения с интерфейсом.
-
-    Битрикс присылает токены формой и ждёт страницу, которая вызовет
-    BX24.installFinish(). Без этого вызова приложение остаётся в состоянии
-    «не установлено» и события в него не идут.
-    """
+    """Битрикс присылает токены формой и ждёт страницу с BX24.installFinish()."""
     payload = await _payload(request)
     saved = _save_auth(payload, source="install")
     log.info("Установка через страницу: токены %s", "сохранены" if saved else "не пришли")
@@ -107,15 +82,10 @@ async def b24_install(request: Request) -> HTMLResponse:
 
 @app.api_route("/b24/handler", methods=["GET", "POST"])
 async def b24_handler(request: Request):
-    """Единая точка для событий и страницы настроек коннектора.
-
-    Битрикс дёргает этот URL в нескольких сценариях, различать их приходится по
-    содержимому формы: PLACEMENT — слайдер настроек, event — событие.
-    """
+    """Единая точка: встройка настроек и события открытых линий."""
     payload = await _payload(request)
 
     if payload.get("PLACEMENT"):
-        log.info("Слайдер настроек: PLACEMENT=%s", payload["PLACEMENT"])
         _save_auth(payload, source="placement")
         return HTMLResponse(_settings_page(payload))
 
@@ -124,10 +94,9 @@ async def b24_handler(request: Request):
         log.info("Запрос без события и встройки, ключи=%s", sorted(payload))
         return JSONResponse({"ok": True})
 
-    # Приложение без интерфейса устанавливается именно так: событием на обработчик.
     if event == "ONAPPINSTALL":
         saved = _save_auth(payload, source="event")
-        log.info("Установка событием ONAPPINSTALL: токены %s", "сохранены" if saved else "отклонены")
+        log.info("Установка событием: токены %s", "сохранены" if saved else "отклонены")
         if saved:
             await _register_connector_safely()
         return JSONResponse({"ok": saved})
@@ -142,61 +111,97 @@ async def b24_handler(request: Request):
         log.warning("Событие %s отклонено: неверный application_token", event)
         return JSONResponse({"ok": False, "error": "invalid token"}, status_code=403)
 
-    # TODO: ONIMCONNECTORMESSAGEADD -> отправка ответа оператора в ДомКлик.
-    log.info("Событие %s принято", event)
+    data = parse_bracketed(payload).get("data") or {}
+
+    if event == "ONIMCONNECTORMESSAGEADD":
+        if runtime.dc is None:
+            log.error("Ответ оператора некуда отправлять: нет сессии ДомКлик")
+            return JSONResponse({"ok": False, "error": "no domclick session"})
+        delivered = await deliver_operator_reply(runtime.dc, BitrixClient(), data)
+        return JSONResponse({"ok": True, "delivered": delivered})
+
+    if event in ("ONIMCONNECTORSTATUSDELETE", "ONIMCONNECTORLINEDELETE"):
+        # Родная кнопка «Отключить» в Битриксе не спрашивает нас — узнаём событием,
+        # иначе наше состояние разъедется с настройками линии.
+        current = state.read_line()
+        if current.get("line"):
+            state.write_line(int(current["line"]), active=False)
+        log.warning("Коннектор отключён на стороне Битрикса (%s)", event)
+        return JSONResponse({"ok": True})
+
+    log.info("Событие %s принято без обработки", event)
     return JSONResponse({"ok": True})
 
 
-@app.post("/b24/connector/activate")
-async def b24_connector_activate(request: Request) -> HTMLResponse:
-    """Подключение или отключение коннектора на выбранной линии.
+# --- служебное: куки ДомКлик ------------------------------------------------
 
-    Форму присылает наша же страница настроек. Эндпоинт публичный, поэтому
-    защищён одноразовым nonce, выданным при её отрисовке.
+@app.get("/admin/cookies")
+async def admin_cookies_form() -> HTMLResponse:
+    """Страница загрузки сессии ДомКлик.
+
+    Вход в кабинет требует SMS, автоматически сервер сессию получить не может.
+    Поэтому раз в N дней сюда приносят свежий storage-state.json.
     """
-    form = await _payload(request)
-    if not _consume_nonce(form.get("nonce", "")):
-        log.warning("Активация отклонена: недействительный nonce")
-        return HTMLResponse(_notice_page("Ссылка устарела. Закройте окно и откройте настройки заново."))
+    return HTMLResponse(_cookies_page(_issue_nonce()))
 
-    line = form.get("line", "").strip()
-    active = form.get("active", "1") == "1"
-    if not line.isdigit():
-        return HTMLResponse(_notice_page("Битрикс не передал идентификатор линии."))
 
+@app.post("/admin/cookies")
+async def admin_cookies_upload(request: Request) -> HTMLResponse:
+    form = await request.form()
+    if not settings.admin_token:
+        return HTMLResponse(_notice_page("ADMIN_TOKEN не задан в окружении — загрузка отключена."))
+    if not _consume_nonce(str(form.get("nonce", ""))):
+        return HTMLResponse(_notice_page("Форма устарела, обновите страницу."))
+    # compare_digest падает на строках с не-ASCII, поэтому сравниваем байты:
+    # иначе пароль с кириллицей ронял бы страницу пятисоткой.
+    supplied = str(form.get("token", "")).encode("utf-8")
+    if not secrets.compare_digest(supplied, settings.admin_token.encode("utf-8")):
+        log.warning("Загрузка кук отклонена: неверный токен")
+        return HTMLResponse(_notice_page("Неверный токен."))
+
+    upload = form.get("state")
+    raw = (await upload.read()).decode("utf-8") if hasattr(upload, "read") else str(form.get("raw", ""))
     try:
-        await BitrixClient().call(
-            "imconnector.activate",
-            {"CONNECTOR": settings.connector_id, "LINE": int(line), "ACTIVE": "1" if active else "0"},
-        )
-    except BitrixError as error:
-        log.error("imconnector.activate не прошёл: %s", error)
-        return HTMLResponse(_notice_page(f"Битрикс отказал: {error.code}. {error.description}"))
+        parsed = json.loads(raw)
+        cookies = [c for c in parsed.get("cookies", []) if "domclick.ru" in c.get("domain", "")]
+    except (json.JSONDecodeError, AttributeError):
+        return HTMLResponse(_notice_page("Это не похоже на storage-state.json."))
+    if not cookies:
+        return HTMLResponse(_notice_page("В файле нет кук домена domclick.ru."))
 
-    write_json(
-        _line_state_path(),
-        {
-            "line": int(line),
-            "active": active,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-    log.info("Коннектор %s на линии %s", "подключён" if active else "отключён", line)
+    write_json(state.cookies_path(), {"cookies": cookies})
+    log.info("Загружено кук ДомКлик: %s", len(cookies))
+    await runtime.restart()
     return HTMLResponse(
-        _notice_page(
-            f"Коннектор {'подключён к линии' if active else 'отключён от линии'} {line}."
-            " Можно закрыть окно."
-        )
+        _notice_page(f"Принято кук: {len(cookies)}. Состояние моста: {runtime.status}.")
     )
 
 
-def _line_state_path():
-    return settings.data_dir / "connector_line.json"
+# --- коннектор --------------------------------------------------------------
 
+def _register_report_path():
+    return settings.data_dir / "connector_registration.json"
+
+
+async def _register_connector_safely() -> None:
+    """Ошибку наружу не выпускаем: установка важнее, а причина видна в /health."""
+    report: dict[str, object] = {"at": datetime.now(timezone.utc).isoformat()}
+    try:
+        report["result"] = await register_connector(BitrixClient())
+        report["ok"] = True
+        log.info("Коннектор зарегистрирован: %s", report["result"])
+    except BitrixError as error:
+        report.update({"ok": False, "error": error.code, "description": error.description})
+        log.error("Регистрация коннектора не удалась: %s", error)
+    except Exception as error:  # noqa: BLE001
+        report.update({"ok": False, "error": type(error).__name__, "description": str(error)})
+        log.exception("Регистрация коннектора упала")
+    write_json(_register_report_path(), report)
+
+
+# --- вспомогательное --------------------------------------------------------
 
 def _issue_nonce() -> str:
-    """Одноразовый ключ для формы настроек. Живёт в памяти: при перезапуске
-    контейнера админ просто откроет слайдер заново."""
     now = time.time()
     for key, expires in list(_nonces.items()):
         if expires < now:
@@ -218,20 +223,14 @@ async def _payload(request: Request) -> dict[str, str]:
 
 
 def _save_auth(payload: dict[str, str], *, source: str) -> bool:
-    """Достаёт токены из запроса и сохраняет их.
-
-    Битрикс присылает авторизацию в двух разных формах: плоскими полями
-    AUTH_ID/REFRESH_ID — при установке через браузер и при открытии встройки,
-    и вложенным объектом auth[...] — в событиях. Поддерживаем оба варианта.
-    """
+    """Битрикс шлёт авторизацию двумя способами: плоскими полями при установке
+    через браузер и вложенным auth[...] в событиях. Поддерживаем оба."""
     access_token = payload.get("AUTH_ID") or payload.get("auth[access_token]")
     if not access_token:
         return False
 
     domain = payload.get("DOMAIN") or payload.get("auth[domain]", "")
     if domain and not _is_our_portal(domain):
-        # Иначе кто угодно смог бы прислать ONAPPINSTALL и подменить токены:
-        # адрес обработчика публично известен.
         log.warning("Запрос с чужого портала отклонён: %s", domain)
         return False
 
@@ -255,11 +254,7 @@ def _save_auth(payload: dict[str, str], *, source: str) -> bool:
 
 
 def _verify_event(payload: dict[str, str]) -> bool:
-    """Сверяет application_token события с сохранённым при установке.
-
-    Путь обработчика публичный, так что без этой проверки любой желающий мог бы
-    слать нам события от имени Битрикса.
-    """
+    """Путь обработчика публичный, поэтому события без верного токена отбиваем."""
     stored = read_json(settings.tokens_path, default={}).get("application_token")
     incoming = payload.get("auth[application_token]") or payload.get("application_token", "")
     return bool(stored) and stored == incoming
@@ -269,6 +264,35 @@ def _is_our_portal(domain: str) -> bool:
     expected = urlparse(settings.b24_portal).netloc or settings.b24_portal
     return domain.strip().lower() == expected.strip().lower()
 
+
+# --- страницы ---------------------------------------------------------------
+
+_PAGE_HEAD = """<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><title>ДомКлик</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; padding: 24px; color: #333; }
+  h3 { margin: 0 0 4px; }
+  .muted { color: #7a8b95; font-size: 13px; margin: 0 0 20px; }
+  .row { margin: 12px 0; }
+  label { display: block; font-size: 13px; color: #55606a; margin-bottom: 4px; }
+  input[type=text], input[type=password], input[type=file] { font: inherit; padding: 7px 9px;
+    border: 1px solid #c6cdd2; border-radius: 4px; width: 320px; max-width: 100%; }
+  button { font: inherit; padding: 9px 18px; border: 0; border-radius: 4px; cursor: pointer;
+    background: #1ab248; color: #fff; }
+  .status { padding: 10px 14px; border-radius: 4px; background: #eef2f4; display: inline-block; }
+  .status.active { background: #e6f6ec; color: #14803a; }
+</style>
+</head>
+<body>
+"""
+
+_PAGE_TAIL = """
+  <script src="//api.bitrix24.com/api/v1/"></script>
+  <script>if (window.BX24) { BX24.init(function () { BX24.fitWindow(); }); }</script>
+</body>
+</html>
+"""
 
 _INSTALL_PAGE = """<!doctype html>
 <html lang="ru">
@@ -281,37 +305,13 @@ _INSTALL_PAGE = """<!doctype html>
 </html>
 """
 
-_PAGE_HEAD = """<!doctype html>
-<html lang="ru">
-<head><meta charset="utf-8"><title>ДомКлик</title>
-<style>
-  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; padding: 24px; color: #333; }
-  h3 { margin: 0 0 4px; }
-  .muted { color: #7a8b95; font-size: 13px; margin: 0 0 20px; }
-  .row { margin: 12px 0; }
-  button { font: inherit; padding: 9px 18px; border: 0; border-radius: 4px; cursor: pointer; }
-  .on { background: #1ab248; color: #fff; }
-  .off { background: #eef2f4; color: #55606a; }
-  .status { padding: 10px 14px; border-radius: 4px; background: #eef2f4; display: inline-block; }
-  .status.active { background: #e6f6ec; color: #14803a; }
-</style>
-</head>
-<body>
-"""
-
-_PAGE_TAIL = """
-  <script src="//api.bitrix24.com/api/v1/"></script>
-  <script>BX24.init(function () { BX24.fitWindow(); });</script>
-</body>
-</html>
-"""
-
 
 def _settings_page(payload: dict[str, str]) -> str:
-    """Страница настроек коннектора внутри слайдера Битрикса.
+    """Страница коннектора в слайдере Битрикса.
 
-    Идентификатор линии Битрикс кладёт в PLACEMENT_OPTIONS — сам он линию не
-    выбирает, а передаёт ту, из настроек которой открыли коннектор.
+    Своей кнопки подключения здесь нет намеренно: рядом уже есть родная
+    битриксовая, и две кнопки для одного действия только путают. Мы лишь
+    запоминаем линию и её состояние, которые Битрикс передаёт в PLACEMENT_OPTIONS.
     """
     options: dict[str, object] = {}
     try:
@@ -324,20 +324,23 @@ def _settings_page(payload: dict[str, str]) -> str:
 
     if not line.isdigit():
         return _notice_page(
-            "Битрикс не передал идентификатор открытой линии. "
-            "Откройте коннектор из настроек конкретной линии в Контакт-центре."
+            "Битрикс не передал идентификатор линии. Откройте коннектор из настроек"
+            " конкретной открытой линии."
         )
 
-    nonce = _issue_nonce()
-    state = (
-        '<span class="status active">Подключён к линии %s</span>' % html.escape(line)
+    state.write_line(int(line), active)
+    log.info("Линия %s, подключение: %s", line, active)
+
+    status = (
+        f'<span class="status active">Подключён к линии {html.escape(line)}</span>'
         if active
-        else '<span class="status">Не подключён</span>'
+        else '<span class="status">Не подключён. Нажмите «Подключить» выше.</span>'
     )
-    button = (
-        ('<button class="off" type="submit" name="active" value="0">Отключить</button>')
-        if active
-        else ('<button class="on" type="submit" name="active" value="1">Подключить</button>')
+    snapshot = runtime.snapshot()
+    session = (
+        '<span class="status active">Сессия ДомКлик активна</span>'
+        if snapshot["connected"]
+        else f'<span class="status">ДомКлик: {html.escape(str(snapshot["status"]))}</span>'
     )
 
     return (
@@ -346,15 +349,33 @@ def _settings_page(payload: dict[str, str]) -> str:
   <h3>ДомКлик</h3>
   <p class="muted">Сообщения из чата подрядчика ДомКлик попадают в эту открытую линию,
      ответы оператора уходят обратно клиенту.</p>
-  <div class="row">{state}</div>
-  <form method="post" action="/b24/connector/activate">
-    <input type="hidden" name="nonce" value="{html.escape(nonce)}">
-    <input type="hidden" name="line" value="{html.escape(line)}">
-    <div class="row">{button}</div>
-  </form>
+  <div class="row">{status}</div>
+  <div class="row">{session}</div>
+  <p class="muted">Передано сообщений: {snapshot["forwarded"]}</p>
 """
         + _PAGE_TAIL
     )
+
+
+def _cookies_page(nonce: str) -> str:
+    return _PAGE_HEAD + f"""
+  <h3>Сессия ДомКлик</h3>
+  <p class="muted">Загрузите storage-state.json, снятый командой
+     <code>npm run export-cookies</code>. Вход в кабинет требует SMS,
+     поэтому сессию приходится обновлять вручную.</p>
+  <form method="post" action="/admin/cookies" enctype="multipart/form-data">
+    <input type="hidden" name="nonce" value="{html.escape(nonce)}">
+    <div class="row">
+      <label>Токен администратора</label>
+      <input type="password" name="token" autocomplete="off" required>
+    </div>
+    <div class="row">
+      <label>Файл сессии</label>
+      <input type="file" name="state" accept="application/json" required>
+    </div>
+    <div class="row"><button type="submit">Загрузить</button></div>
+  </form>
+""" + _PAGE_TAIL
 
 
 def _notice_page(message: str) -> str:
