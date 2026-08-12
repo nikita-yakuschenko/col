@@ -16,13 +16,17 @@ const OUT = path.resolve(HERE, '..', 'storage-state.json');
 
 const CABINET = process.env.DOMCLICK_START_URL ?? 'https://homeland-projects.domclick.ru/';
 
+// Заходим на оба домена: localStorage у них раздельный, а токен для хранилища
+// файлов лежит именно на domclick.ru. Без визита Playwright его не соберёт.
+const ORIGINS = [CABINET, 'https://domclick.ru/'];
+
 const context = await chromium.launchPersistentContext(USER_DATA_DIR, { headless: true });
 
-// Обязательно открыть страницу: без визита Playwright не собирает localStorage,
-// а там лежит x-access-token, без которого не работает загрузка файлов.
 const page = await context.newPage();
-await page.goto(CABINET, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
-await page.waitForTimeout(3000);
+for (const origin of ORIGINS) {
+  await page.goto(origin, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+}
 
 const state = await context.storageState({ path: OUT });
 await context.close();
