@@ -1,0 +1,25 @@
+# Секреты
+.env
+*.env
+!.env.example
+
+# Дампы разведки — содержат живые токены, куки и переписку
+recon-out/
+recon/.userdata/
+storage-state.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,37 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      # Значения задаются в интерфейсе Dokploy, в репозитории их нет.
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      B24_PORTAL: ${B24_PORTAL:-}
+      B24_CLIENT_ID: ${B24_CLIENT_ID:-}
+      B24_CLIENT_SECRET: ${B24_CLIENT_SECRET:-}
+      CONNECTOR_ID: ${CONNECTOR_ID:-}
+      DOMCLICK_USER_1: ${DOMCLICK_USER_1:-}
+      DOMCLICK_USER_2: ${DOMCLICK_USER_2:-}
+      DOMCLICK_USER_3: ${DOMCLICK_USER_3:-}
+      DOMCLICK_PASSWORD: ${DOMCLICK_PASSWORD:-}
+    volumes:
+      # Токены Битрикса и куки ДомКлик. Снести том = проходить установку и SMS заново.
+      - domclick-data:/data
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - dokploy-network
+
+volumes:
+  domclick-data:
+
+networks:
+  # Traefik в Dokploy маршрутизирует только то, что подключено к этой сети.
+  dokploy-network:
+    external: true

@@ -1,0 +1,16 @@
+{
+  "name": "domclick-recon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Одноразовая разведка сетевого обмена кабинета ДомКлик. Не часть боевого сервиса.",
+  "scripts": {
+    "postinstall": "playwright install chromium",
+    "capture": "node capture.mjs",
+    "analyze": "node analyze.mjs",
+    "export-cookies": "node export-cookies.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}
