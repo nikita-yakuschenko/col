@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,31 @@ def bridge_path() -> Path:
 
 def cookies_path() -> Path:
     return settings.data_dir / "domclick_cookies.json"
+
+
+def files_path() -> Path:
+    return settings.data_dir / "file_links.json"
+
+
+# Ссылки на вложения живут сутки: Битрикс скачивает файл сразу и кладёт себе,
+# да и в самом ДомКлик файлы хранятся примерно столько же.
+FILE_TTL_SECONDS = 24 * 3600
+
+
+def remember_file(token: str, source_url: str, name: str) -> None:
+    links = read_json(files_path(), default={}) or {}
+    now = int(time.time())
+    # Заодно подчищаем протухшие, иначе файл будет пухнуть вечно.
+    links = {key: item for key, item in links.items() if int(item.get("expires", 0)) > now}
+    links[token] = {"url": source_url, "name": name, "expires": now + FILE_TTL_SECONDS}
+    write_json(files_path(), links)
+
+
+def lookup_file(token: str) -> dict[str, Any] | None:
+    item = (read_json(files_path(), default={}) or {}).get(token)
+    if not item or int(item.get("expires", 0)) <= int(time.time()):
+        return None
+    return item
 
 
 def read_line() -> dict[str, Any]:

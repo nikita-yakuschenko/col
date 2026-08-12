@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import time
 from typing import Any
 
@@ -99,7 +100,8 @@ class Bridge:
         if not message_id:
             return "нет идентификатора"
 
-        if message.get("type") != "message":
+        # fileSet — сообщение с вложением, оно нам тоже нужно.
+        if message.get("type") not in ("message", "fileSet"):
             return "служебное сообщение"
 
         sender = message.get("fromCasId")
@@ -135,6 +137,20 @@ class Bridge:
         if project:
             chat_name = f"ДомКлик · {project.group(1)}"
 
+        payload_message: dict[str, Any] = {
+            "id": str(message.get("_id")),
+            "date": int(int(message.get("time") or 0) / 1000),
+            "text": text,
+        }
+
+        files = _publish_files(message)
+        if files:
+            payload_message["files"] = files
+            if not text:
+                # Битриксу нужен хотя бы один из двух: текст или файлы. Текст
+                # оставляем осмысленным, иначе в чате будет пустой пузырь.
+                payload_message["text"] = "Вложение"
+
         return {
             "user": {
                 # casId сквозной по экосистеме Сбера и не меняется — именно по
@@ -143,16 +159,31 @@ class Bridge:
                 "name": first_name,
                 "last_name": last_name,
             },
-            "message": {
-                "id": str(message.get("_id")),
-                "date": int(int(message.get("time") or 0) / 1000),
-                "text": text,
-            },
+            "message": payload_message,
             "chat": {
                 "id": str(message.get("roomId") or ""),
                 "name": chat_name,
             },
         }
+
+
+def _publish_files(message: dict[str, Any]) -> list[dict[str, str]]:
+    """Готовит вложения к передаче в Битрикс.
+
+    Ссылки ДомКлик открываются только с куками сессии, а Битрикс качает файлы
+    анонимно и получил бы 401. Поэтому на каждый файл заводим одноразовый адрес
+    на нашем сервисе, а тот уже скачивает оригинал с куками.
+    """
+    published: list[dict[str, str]] = []
+    for item in message.get("files") or []:
+        source = str(item.get("url") or "")
+        name = str(item.get("name") or item.get("filename") or "file")
+        if not source:
+            continue
+        token = secrets.token_urlsafe(24)
+        state.remember_file(token, source, name)
+        published.append({"url": f"{settings.public_url}/f/{token}", "name": name})
+    return published
 
 
 async def deliver_operator_reply(

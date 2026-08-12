@@ -137,6 +137,22 @@ class DomClickClient:
             raise RuntimeError(f"Отправка не удалась: HTTP {response.status_code} {response.text[:200]}")
         return body
 
+    async def fetch_file(self, url: str) -> tuple[bytes, str]:
+        """Скачивает вложение по ссылке из сообщения.
+
+        Такие ссылки отдают файл только с куками сессии — анонимно приходит 401.
+        """
+        async with httpx.AsyncClient(
+            headers={**_HEADERS, "Accept": "*/*"},
+            cookies=self._cookies,
+            timeout=self._timeout,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(url)
+        self._guard(response)
+        response.raise_for_status()
+        return response.content, response.headers.get("content-type", "application/octet-stream")
+
     async def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         async with self._client() as client:
             response = await client.get(url, params=params)

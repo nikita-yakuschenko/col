@@ -13,10 +13,10 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from app import state
 from app.bitrix import BitrixClient, BitrixError, register_connector
@@ -148,6 +148,39 @@ async def b24_handler(request: Request):
 
 
 # --- служебное: куки ДомКлик ------------------------------------------------
+
+@app.get("/f/{token}")
+async def serve_attachment(token: str):
+    """Отдаёт вложение из ДомКлик по одноразовой ссылке.
+
+    Оригинальные ссылки требуют кук сессии, а Битрикс качает файлы анонимно.
+    Поэтому он приходит сюда, а мы уже забираем файл с авторизацией.
+    """
+    link = state.lookup_file(token)
+    if not link:
+        return JSONResponse({"error": "not found or expired"}, status_code=404)
+    if runtime.dc is None:
+        return JSONResponse({"error": "no domclick session"}, status_code=503)
+
+    try:
+        content, content_type = await runtime.dc.fetch_file(link["url"])
+    except Exception as error:  # noqa: BLE001
+        log.exception("Не удалось скачать вложение")
+        return JSONResponse({"error": str(error)}, status_code=502)
+
+    name = str(link.get("name") or "file")
+    ascii_name = name.encode("ascii", "ignore").decode() or "file"
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": (
+                f'inline; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{quote(name)}"
+            )
+        },
+    )
+
 
 @app.get("/admin/cookies")
 async def admin_cookies_form() -> HTMLResponse:
