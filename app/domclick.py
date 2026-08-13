@@ -8,16 +8,20 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import uuid
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from app.config import settings
+
 log = logging.getLogger("bridge.domclick")
 
 CHAT_API = "https://ipoteka.domclick.ru/chat/api/v3"
 AUTH_ME = "https://api.domclick.ru/auth/me"
+STORAGE_API = "https://api.domclick.ru/storage/files"
 CABINET = "https://homeland-projects.domclick.ru"
 
 # Системный отправитель ДомКлик: служебные сообщения вроде «Чат создан».
@@ -135,6 +139,71 @@ class DomClickClient:
         self._guard(response)
         if response.status_code not in (200, 201):
             raise RuntimeError(f"Отправка не удалась: HTTP {response.status_code} {response.text[:200]}")
+        return body
+
+    async def upload_file(
+        self,
+        room_id: str,
+        content: bytes,
+        filename: str,
+        content_type: str = "application/octet-stream",
+    ) -> dict[str, Any]:
+        """Кладёт файл в хранилище ДомКлик.
+
+        Две неочевидные вещи, без которых приходит 403 с пустым телом:
+        в форме кроме файла обязателен `roomId`, а в заголовке `x-access-token`
+        нужен системный JWT хранилища — не тот короткий ключ, что ходит с
+        остальными запросами к api.domclick.ru.
+        """
+        if not settings.domclick_storage_token:
+            raise RuntimeError("DOMCLICK_STORAGE_TOKEN не задан — загрузка файлов недоступна")
+
+        params = {"req-id": f"chat-{secrets.token_hex(5)}", "countDayStorage": 1}
+        headers = {**_HEADERS, "x-access-token": settings.domclick_storage_token}
+
+        async with httpx.AsyncClient(
+            headers=headers, cookies=self._cookies, timeout=self._timeout
+        ) as client:
+            response = await client.post(
+                STORAGE_API,
+                params=params,
+                files={"file": (filename, content, content_type)},
+                data={"roomId": room_id},
+            )
+        self._guard(response)
+        if response.status_code != 200:
+            raise RuntimeError(f"Загрузка не удалась: HTTP {response.status_code} {response.text[:200]}")
+        return response.json()
+
+    async def send_files(
+        self, room_id: str, uploaded: list[dict[str, Any]], message_uuid: str | None = None
+    ) -> dict[str, Any]:
+        """Отправляет в комнату сообщение-вложение из уже загруженных файлов."""
+        body = {
+            "type": "fileSet",
+            "files": [
+                {
+                    "id": item["id"],
+                    "name": item.get("filename") or item.get("name") or "file",
+                    "filename": item.get("filename") or item.get("name") or "file",
+                    "path": item["path"],
+                    "size": item.get("size", 0),
+                    "ownerId": item.get("owner_id"),
+                }
+                for item in uploaded
+            ],
+            "message": "",
+            "uuid": message_uuid or str(uuid.uuid4()),
+        }
+        async with self._client() as client:
+            response = await client.post(
+                f"{CHAT_API}/rooms/{room_id}/messages",
+                params={"bot_buttons": "true"},
+                json=body,
+            )
+        self._guard(response)
+        if response.status_code not in (200, 201):
+            raise RuntimeError(f"Отправка файла не удалась: HTTP {response.status_code} {response.text[:200]}")
         return body
 
     async def fetch_file(self, url: str) -> tuple[bytes, str]:

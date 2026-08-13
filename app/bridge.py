@@ -210,6 +210,23 @@ async def deliver_operator_reply(
             cas_id = (item.get("message") or {}).get("user_id")
             room_id = state.room_for(int(cas_id)) if cas_id else ""
 
+        attachments = _operator_files(item)
+        if attachments and room_id:
+            delivered_files = await _send_operator_files(dc, room_id, attachments)
+            if delivered_files:
+                delivered.append(
+                    {
+                        "im": {
+                            "chat_id": _as_int(im.get("chat_id")),
+                            "message_id": _as_int(im.get("message_id")),
+                        },
+                        "message": {"id": [delivered_files["uuid"]], "date": int(time.time())},
+                        "chat": {"id": room_id},
+                    }
+                )
+            if not text:
+                continue
+
         if not text or not room_id:
             # Скорее всего оператор приложил файл: события с вложениями Битрикс
             # шлёт без текста. Пишем payload целиком — по нему разберём формат
@@ -247,6 +264,66 @@ async def deliver_operator_reply(
             log.exception("Подтверждение доставки не прошло")
 
     return len(delivered)
+
+
+def _operator_files(item: dict[str, Any]) -> list[dict[str, str]]:
+    """Вытаскивает вложения оператора из события Битрикса.
+
+    Формат в документации не описан, поэтому принимаем несколько вариантов
+    названий полей — какое из них живое, покажет боевое событие.
+    """
+    raw = (item.get("message") or {}).get("files")
+    found: list[dict[str, str]] = []
+    for entry in _as_list(raw):
+        link = str(
+            entry.get("link") or entry.get("url") or entry.get("urlDownload") or entry.get("src") or ""
+        )
+        name = str(entry.get("name") or entry.get("fileName") or entry.get("filename") or "file")
+        if link:
+            found.append({"link": link, "name": name})
+    return found
+
+
+async def _send_operator_files(
+    dc: domclick.DomClickClient, room_id: str, attachments: list[dict[str, str]]
+) -> dict[str, Any] | None:
+    """Скачивает файлы из Битрикса и отправляет их в чат ДомКлик."""
+    uploaded: list[dict[str, Any]] = []
+    for attachment in attachments:
+        try:
+            content, content_type = await _download_from_bitrix(attachment["link"])
+            uploaded.append(
+                await dc.upload_file(room_id, content, attachment["name"], content_type)
+            )
+        except Exception:  # noqa: BLE001 — один файл не должен рушить остальные
+            log.exception("Не удалось перенести вложение %s", attachment["name"])
+
+    if not uploaded:
+        return None
+    try:
+        return await dc.send_files(room_id, uploaded)
+    except Exception:  # noqa: BLE001
+        log.exception("Файлы загружены, но сообщение с ними не отправилось")
+        return None
+
+
+async def _download_from_bitrix(link: str) -> tuple[bytes, str]:
+    """Качает файл из Битрикса.
+
+    Ссылки на файлы открытых линий бывают и публичными, и требующими токен,
+    поэтому при отказе повторяем с авторизацией приложения.
+    """
+    import httpx
+
+    from app.storage import read_json
+
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        response = await client.get(link)
+        if response.status_code in (401, 403):
+            token = (read_json(settings.tokens_path, default={}) or {}).get("access_token", "")
+            response = await client.get(link, params={"auth": token})
+    response.raise_for_status()
+    return response.content, response.headers.get("content-type", "application/octet-stream")
 
 
 def parse_bracketed(form: dict[str, str]) -> dict[str, Any]:

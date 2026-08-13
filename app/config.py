@@ -32,6 +32,10 @@ class Settings:
     # Пароль к странице загрузки кук ДомКлик. Пустой — загрузка отключена.
     admin_token: str
 
+    # Системный JWT хранилища файлов ДомКлик. Без него не отправить вложение
+    # оператора клиенту. Достаётся из трафика: scripts/show_storage_token.py
+    domclick_storage_token: str
+
     @property
     def tokens_path(self) -> Path:
         return self.data_dir / "b24_tokens.json"
@@ -63,6 +67,7 @@ def load_settings() -> Settings:
         b24_client_secret=_env("B24_CLIENT_SECRET"),
         connector_id=_env("CONNECTOR_ID"),
         admin_token=_env("ADMIN_TOKEN"),
+        domclick_storage_token=_env("DOMCLICK_STORAGE_TOKEN"),
     )
 
 
