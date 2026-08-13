@@ -29,6 +29,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
 )
+# httpx пишет в лог полный URL каждого запроса вместе с query-параметрами —
+# туда попадают токены и ссылки на файлы. Оставляем только предупреждения.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 log = logging.getLogger("bridge")
 
 # Одноразовые ключи для формы загрузки кук: nonce -> момент истечения.

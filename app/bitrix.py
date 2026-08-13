@@ -69,10 +69,12 @@ class BitrixClient:
         if not refresh_token:
             raise BitrixError("NO_REFRESH_TOKEN", "Нечем обновлять, нужна переустановка приложения")
 
+        # Строго POST с телом: при GET секреты уезжают в query, а httpx пишет
+        # полный URL в лог — client_secret и refresh_token оказываются в логах.
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(
+            response = await client.post(
                 OAUTH_URL,
-                params={
+                data={
                     "grant_type": "refresh_token",
                     "client_id": settings.b24_client_id,
                     "client_secret": settings.b24_client_secret,
