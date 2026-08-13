@@ -155,7 +155,11 @@ async def register_connector(client: BitrixClient) -> dict[str, Any]:
             )
         except BitrixError as error:
             # Повторная подписка на уже привязанное событие — не повод падать.
-            if error.code == "ERROR_EVENT_BINDING_EXISTS":
+            # При переустановке приложения Битрикс отвечает на это по-разному.
+            already = error.code == "ERROR_EVENT_BINDING_EXISTS" or "already binded" in (
+                error.description or ""
+            )
+            if already:
                 result[event] = "already bound"
             else:
                 raise
